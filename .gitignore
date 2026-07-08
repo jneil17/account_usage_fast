@@ -1,0 +1,15 @@
+# macOS and editor artifacts
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local environment files
+.env
+.venv/
+venv/
