@@ -710,6 +710,336 @@
           }
         }
       ]
+    },
+    {
+      "name": "cpq_query_detail",
+      "displayName": "cpq_query_detail",
+      "queryLines": [
+        "WITH prices AS (\n",
+        "  SELECT sku_name, usage_unit, price_start_time,\n",
+        "    COALESCE(price_end_time, DATE_ADD(CURRENT_DATE, 1)) AS price_end_time,\n",
+        "    try_variant_get(to_variant_object(pricing), '$.effective_list.default', 'decimal(38,18)') AS unit_px\n",
+        "  FROM system.billing.list_prices WHERE currency_code = 'USD'\n",
+        "),\n",
+        "warehouse_hour_cost AS (\n",
+        "  SELECT u.usage_metadata.warehouse_id AS warehouse_id,\n",
+        "    DATE_TRUNC('HOUR', u.usage_end_time) AS usage_hour,\n",
+        "    SUM(u.usage_quantity * COALESCE(p.unit_px, 0)) AS hour_cost_usd,\n",
+        "    SUM(u.usage_quantity) AS hour_dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  LEFT JOIN prices p ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n",
+        "    AND u.usage_end_time BETWEEN p.price_start_time AND p.price_end_time\n",
+        "  WHERE u.usage_date BETWEEN :time_range.min AND :time_range.max\n",
+        "    AND u.billing_origin_product = 'SQL'\n",
+        "    AND u.usage_metadata.warehouse_id IS NOT NULL\n",
+        "  GROUP BY 1, 2\n",
+        "),\n",
+        "query_base AS (\n",
+        "  SELECT\n",
+        "    q.statement_id, q.workspace_id, q.compute.warehouse_id AS warehouse_id,\n",
+        "    DATE_TRUNC('HOUR', q.start_time) AS query_start_hour,\n",
+        "    q.start_time, q.end_time, q.executed_by, q.execution_status,\n",
+        "    q.client_application, q.from_result_cache,\n",
+        "    COALESCE(q.total_task_duration_ms, q.execution_duration_ms, 0) AS compute_ms,\n",
+        "    q.execution_duration_ms, q.total_task_duration_ms,\n",
+        "    COALESCE(q.waiting_at_capacity_duration_ms, 0) AS queue_ms,\n",
+        "    CASE\n",
+        "      WHEN q.query_source.job_info.job_id IS NOT NULL  THEN 'JOB'\n",
+        "      WHEN q.query_source.dashboard_id   IS NOT NULL   THEN 'DASHBOARD'\n",
+        "      WHEN q.query_source.notebook_id    IS NOT NULL   THEN 'NOTEBOOK'\n",
+        "      WHEN q.query_source.genie_space_id IS NOT NULL   THEN 'GENIE'\n",
+        "      WHEN q.query_source.alert_id       IS NOT NULL   THEN 'ALERT'\n",
+        "      WHEN q.query_source.sql_query_id   IS NOT NULL   THEN 'SAVED_QUERY'\n",
+        "      ELSE 'DIRECT'\n",
+        "    END AS query_source_type,\n",
+        "    COALESCE(q.query_tags['tenant'], q.executed_by) AS tenant_key,\n",
+        "    CASE WHEN q.query_tags['tenant'] IS NOT NULL THEN 'QUERY_TAG' ELSE 'FALLBACK_IDENTITY' END\n",
+        "      AS tenant_resolution_method\n",
+        "  FROM system.query.history q\n",
+        "  WHERE CAST(q.start_time AS DATE) BETWEEN :time_range.min AND :time_range.max\n",
+        "    AND q.compute.warehouse_id IS NOT NULL\n",
+        "),\n",
+        "query_hour_totals AS (\n",
+        "  SELECT warehouse_id, query_start_hour, SUM(compute_ms) AS total_compute_ms_in_hour\n",
+        "  FROM query_base GROUP BY 1, 2\n",
+        "),\n",
+        "warehouse_snapshot AS (\n",
+        "  SELECT warehouse_id, warehouse_name, workspace_id,\n",
+        "    CASE WHEN delete_time IS NOT NULL THEN 'Deleted' ELSE 'Active' END AS is_deleted\n",
+        "  FROM system.compute.warehouses\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC) = 1\n",
+        "),\n",
+        "cpq AS (\n",
+        "  SELECT\n",
+        "    qb.statement_id,\n",
+        "    qb.start_time,\n",
+        "    qb.executed_by,\n",
+        "    qb.tenant_key,\n",
+        "    qb.tenant_resolution_method,\n",
+        "    qb.query_source_type,\n",
+        "    qb.client_application,\n",
+        "    qb.execution_status,\n",
+        "    qb.from_result_cache,\n",
+        "    qb.execution_duration_ms,\n",
+        "    qb.total_task_duration_ms,\n",
+        "    qb.queue_ms,\n",
+        "    CONCAT(w.warehouse_name, ' (id:', qb.warehouse_id, ')') AS warehouse_name_display,\n",
+        "    w.is_deleted                                              AS is_warehouse_deleted,\n",
+        "    CASE WHEN ht.total_compute_ms_in_hour > 0\n",
+        "         THEN wh.hour_cost_usd * (qb.compute_ms / ht.total_compute_ms_in_hour) ELSE 0\n",
+        "    END AS query_attributed_dollars_estimation,\n",
+        "    CASE WHEN ht.total_compute_ms_in_hour > 0\n",
+        "         THEN wh.hour_dbus * (qb.compute_ms / ht.total_compute_ms_in_hour) ELSE 0\n",
+        "    END AS query_attributed_dbus_estimation\n",
+        "  FROM query_base qb\n",
+        "  JOIN warehouse_hour_cost  wh ON qb.warehouse_id = wh.warehouse_id AND qb.query_start_hour = wh.usage_hour\n",
+        "  JOIN query_hour_totals    ht ON qb.warehouse_id = ht.warehouse_id AND qb.query_start_hour = ht.query_start_hour\n",
+        "  INNER JOIN warehouse_snapshot w ON qb.workspace_id = w.workspace_id AND qb.warehouse_id = w.warehouse_id\n",
+        ")\n",
+        "SELECT\n",
+        "  c.*,\n",
+        "  c.query_attributed_dollars_estimation * (1 - CAST(:dbsql_discount AS FLOAT))\n",
+        "    AS query_attributed_dollars_with_discount,\n",
+        "  -- HTML data-bar: attributed $ (brand red-orange #FF3621)\n",
+        "  COALESCE(CONCAT(\n",
+        "    '<div style=\"position:relative;height:20px;border-radius:4px;overflow:hidden;\">',\n",
+        "    '<div style=\"position:absolute;width:',\n",
+        "    ROUND(\n",
+        "      (c.query_attributed_dollars_estimation - MIN(c.query_attributed_dollars_estimation) OVER())\n",
+        "      / NULLIF(MAX(c.query_attributed_dollars_estimation) OVER() - MIN(c.query_attributed_dollars_estimation) OVER(), 0)\n",
+        "      * 100, 2),\n",
+        "    '%;height:100%;background:#FF3621;border-radius:4px;\"></div>',\n",
+        "    '<span style=\"position:absolute;width:100%;text-align:center;line-height:20px;font-weight:bold;color:#1B2733;\">$',\n",
+        "    FORMAT_NUMBER(c.query_attributed_dollars_estimation * (1 - CAST(:dbsql_discount AS FLOAT)), 2),\n",
+        "    '</span></div>'), '--') AS allocated_dollars_bar_html,\n",
+        "  -- HTML data-bar: attributed DBUs (blue #2166CB)\n",
+        "  COALESCE(CONCAT(\n",
+        "    '<div style=\"position:relative;height:20px;border-radius:4px;overflow:hidden;\">',\n",
+        "    '<div style=\"position:absolute;width:',\n",
+        "    ROUND(\n",
+        "      (c.query_attributed_dbus_estimation - MIN(c.query_attributed_dbus_estimation) OVER())\n",
+        "      / NULLIF(MAX(c.query_attributed_dbus_estimation) OVER() - MIN(c.query_attributed_dbus_estimation) OVER(), 0)\n",
+        "      * 100, 2),\n",
+        "    '%;height:100%;background:#2166CB;border-radius:4px;\"></div>',\n",
+        "    '<span style=\"position:absolute;width:100%;text-align:center;line-height:20px;font-weight:bold;color:#1B2733;\">',\n",
+        "    FORMAT_NUMBER(c.query_attributed_dbus_estimation, 2),\n",
+        "    '</span></div>'), '--') AS allocated_dbus_bar_html\n",
+        "FROM cpq c\n",
+        "ORDER BY c.query_attributed_dollars_estimation DESC"
+      ],
+      "parameters": [
+        {
+          "displayName": "Time Range",
+          "keyword": "time_range",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        },
+        {
+          "displayName": "DBSQL Discount",
+          "keyword": "dbsql_discount",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "cpq_warehouse_stats",
+      "displayName": "cpq_warehouse_stats",
+      "queryLines": [
+        "WITH prices AS (\n",
+        "  SELECT sku_name, usage_unit, price_start_time,\n",
+        "    COALESCE(price_end_time, DATE_ADD(CURRENT_DATE, 1)) AS price_end_time,\n",
+        "    try_variant_get(to_variant_object(pricing), '$.effective_list.default', 'decimal(38,18)') AS unit_px\n",
+        "  FROM system.billing.list_prices WHERE currency_code = 'USD'\n",
+        "),\n",
+        "warehouse_hour_cost AS (\n",
+        "  SELECT u.usage_metadata.warehouse_id AS warehouse_id,\n",
+        "    DATE_TRUNC('HOUR', u.usage_end_time) AS usage_hour,\n",
+        "    SUM(u.usage_quantity * COALESCE(p.unit_px, 0)) AS hour_cost_usd\n",
+        "  FROM system.billing.usage u\n",
+        "  LEFT JOIN prices p ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n",
+        "    AND u.usage_end_time BETWEEN p.price_start_time AND p.price_end_time\n",
+        "  WHERE u.usage_date BETWEEN :time_range.min AND :time_range.max\n",
+        "    AND u.billing_origin_product = 'SQL'\n",
+        "    AND u.usage_metadata.warehouse_id IS NOT NULL\n",
+        "  GROUP BY 1, 2\n",
+        "),\n",
+        "query_base AS (\n",
+        "  SELECT\n",
+        "    q.compute.warehouse_id AS warehouse_id,\n",
+        "    q.workspace_id,\n",
+        "    DATE_TRUNC('HOUR', q.start_time) AS query_start_hour,\n",
+        "    COALESCE(q.total_task_duration_ms, q.execution_duration_ms, 0) AS compute_ms\n",
+        "  FROM system.query.history q\n",
+        "  WHERE CAST(q.start_time AS DATE) BETWEEN :time_range.min AND :time_range.max\n",
+        "    AND q.compute.warehouse_id IS NOT NULL\n",
+        "),\n",
+        "query_hour_totals AS (\n",
+        "  SELECT warehouse_id, query_start_hour, SUM(compute_ms) AS total_compute_ms_in_hour\n",
+        "  FROM query_base GROUP BY 1, 2\n",
+        "),\n",
+        "warehouse_snapshot AS (\n",
+        "  SELECT warehouse_id, warehouse_name, workspace_id\n",
+        "  FROM system.compute.warehouses\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC) = 1\n",
+        "),\n",
+        "cpq AS (\n",
+        "  SELECT\n",
+        "    CONCAT(w.warehouse_name, ' (id:', qb.warehouse_id, ')') AS warehouse_name_display,\n",
+        "    CASE WHEN ht.total_compute_ms_in_hour > 0\n",
+        "         THEN wh.hour_cost_usd * (qb.compute_ms / ht.total_compute_ms_in_hour)\n",
+        "         ELSE 0\n",
+        "    END AS cost_per_query\n",
+        "  FROM query_base qb\n",
+        "  JOIN warehouse_hour_cost  wh ON qb.warehouse_id = wh.warehouse_id AND qb.query_start_hour = wh.usage_hour\n",
+        "  JOIN query_hour_totals    ht ON qb.warehouse_id = ht.warehouse_id AND qb.query_start_hour = ht.query_start_hour\n",
+        "  INNER JOIN warehouse_snapshot w ON qb.workspace_id = w.workspace_id AND qb.warehouse_id = w.warehouse_id\n",
+        ")\n",
+        "SELECT\n",
+        "  warehouse_name_display,\n",
+        "  COUNT(*)                                                              AS query_count,\n",
+        "  ROUND(AVG(cost_per_query), 6)                                        AS avg_cost_per_query,\n",
+        "  ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cost_per_query), 6) AS median_cost_per_query,\n",
+        "  ROUND(MAX(cost_per_query), 6)                                        AS max_cost_per_query,\n",
+        "  -- Min excludes zero-cost queries (cache hits / sub-ms) to avoid distorting the floor\n",
+        "  ROUND(MIN(CASE WHEN cost_per_query > 0 THEN cost_per_query END), 6)  AS min_cost_per_query,\n",
+        "  ROUND(SUM(cost_per_query), 4)                                        AS total_attributed_cost\n",
+        "FROM cpq\n",
+        "GROUP BY 1\n",
+        "ORDER BY avg_cost_per_query DESC"
+      ],
+      "parameters": [
+        {
+          "displayName": "Time Range",
+          "keyword": "time_range",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "cpq_wh_stats_chart",
+      "displayName": "cpq_warehouse_stats_chart",
+      "queryLines": [
+        "WITH prices AS (\n",
+        "  SELECT sku_name, usage_unit, price_start_time,\n",
+        "    COALESCE(price_end_time, DATE_ADD(CURRENT_DATE, 1)) AS price_end_time,\n",
+        "    try_variant_get(to_variant_object(pricing), '$.effective_list.default', 'decimal(38,18)') AS unit_px\n",
+        "  FROM system.billing.list_prices WHERE currency_code = 'USD'\n",
+        "),\n",
+        "warehouse_hour_cost AS (\n",
+        "  SELECT u.usage_metadata.warehouse_id AS warehouse_id,\n",
+        "    DATE_TRUNC('HOUR', u.usage_end_time) AS usage_hour,\n",
+        "    SUM(u.usage_quantity * COALESCE(p.unit_px, 0)) AS hour_cost_usd\n",
+        "  FROM system.billing.usage u\n",
+        "  LEFT JOIN prices p ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n",
+        "    AND u.usage_end_time BETWEEN p.price_start_time AND p.price_end_time\n",
+        "  WHERE u.usage_date BETWEEN :time_range.min AND :time_range.max\n",
+        "    AND u.billing_origin_product = 'SQL'\n",
+        "    AND u.usage_metadata.warehouse_id IS NOT NULL\n",
+        "  GROUP BY 1, 2\n",
+        "),\n",
+        "query_base AS (\n",
+        "  SELECT\n",
+        "    q.compute.warehouse_id AS warehouse_id,\n",
+        "    q.workspace_id,\n",
+        "    DATE_TRUNC('HOUR', q.start_time) AS query_start_hour,\n",
+        "    COALESCE(q.total_task_duration_ms, q.execution_duration_ms, 0) AS compute_ms\n",
+        "  FROM system.query.history q\n",
+        "  WHERE CAST(q.start_time AS DATE) BETWEEN :time_range.min AND :time_range.max\n",
+        "    AND q.compute.warehouse_id IS NOT NULL\n",
+        "),\n",
+        "query_hour_totals AS (\n",
+        "  SELECT warehouse_id, query_start_hour, SUM(compute_ms) AS total_compute_ms_in_hour\n",
+        "  FROM query_base GROUP BY 1, 2\n",
+        "),\n",
+        "warehouse_snapshot AS (\n",
+        "  SELECT warehouse_id, warehouse_name, workspace_id\n",
+        "  FROM system.compute.warehouses\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC) = 1\n",
+        "),\n",
+        "cpq AS (\n",
+        "  SELECT\n",
+        "    CONCAT(w.warehouse_name, ' (id:', qb.warehouse_id, ')') AS warehouse_name_display,\n",
+        "    CASE WHEN ht.total_compute_ms_in_hour > 0\n",
+        "         THEN wh.hour_cost_usd * (qb.compute_ms / ht.total_compute_ms_in_hour)\n",
+        "         ELSE 0\n",
+        "    END AS cost_per_query\n",
+        "  FROM query_base qb\n",
+        "  JOIN warehouse_hour_cost  wh ON qb.warehouse_id = wh.warehouse_id AND qb.query_start_hour = wh.usage_hour\n",
+        "  JOIN query_hour_totals    ht ON qb.warehouse_id = ht.warehouse_id AND qb.query_start_hour = ht.query_start_hour\n",
+        "  INNER JOIN warehouse_snapshot w ON qb.workspace_id = w.workspace_id AND qb.warehouse_id = w.warehouse_id\n",
+        "),\n",
+        "stats AS (\n",
+        "  SELECT\n",
+        "    warehouse_name_display,\n",
+        "    ROUND(AVG(cost_per_query), 6)                                         AS avg_val,\n",
+        "    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cost_per_query), 6) AS median_val,\n",
+        "    ROUND(MAX(cost_per_query), 6)                                         AS max_val,\n",
+        "    ROUND(MIN(CASE WHEN cost_per_query > 0 THEN cost_per_query END), 6)   AS min_val\n",
+        "  FROM cpq\n",
+        "  GROUP BY 1\n",
+        ")\n",
+        "-- Unpivot: one row per (warehouse, metric), sorted so avg appears first in legend\n",
+        "SELECT warehouse_name_display, 'Average'        AS metric, avg_val    AS cost_per_query, avg_val AS sort_key FROM stats\n",
+        "UNION ALL\n",
+        "SELECT warehouse_name_display, 'Median'         AS metric, median_val, avg_val FROM stats\n",
+        "UNION ALL\n",
+        "SELECT warehouse_name_display, 'Max'            AS metric, max_val,    avg_val FROM stats\n",
+        "UNION ALL\n",
+        "SELECT warehouse_name_display, 'Min (non-zero)' AS metric, min_val,    avg_val FROM stats\n",
+        "ORDER BY sort_key DESC, warehouse_name_display, metric"
+      ],
+      "parameters": [
+        {
+          "displayName": "Time Range",
+          "keyword": "time_range",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
     }
   ],
   "pages": [
@@ -1622,6 +1952,395 @@
       "layoutVersion": "GRID_V1"
     },
     {
+      "name": "cost_per_query",
+      "displayName": "Cost per Query",
+      "layout": [
+        {
+          "widget": {
+            "name": "header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Cost per Query\n",
+                "---\n",
+                "Compute-time-share attribution · discount-adjusted · ordered by attributed cost"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cpq_query_detail",
+                  "fields": [
+                    {
+                      "name": "sum(query_attributed_dollars_with_discount)",
+                      "expression": "SUM(`query_attributed_dollars_with_discount`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Total Attributed Cost",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(query_attributed_dollars_with_discount)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_dbus",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cpq_query_detail",
+                  "fields": [
+                    {
+                      "name": "sum(query_attributed_dbus_estimation)",
+                      "expression": "SUM(`query_attributed_dbus_estimation`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Total Attributed DBUs",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(query_attributed_dbus_estimation)",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_queries",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cpq_query_detail",
+                  "fields": [
+                    {
+                      "name": "countdistinct(statement_id)",
+                      "expression": "COUNT(DISTINCT `statement_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "title": "Total Queries",
+                "showTitle": true
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(statement_id)",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "main_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cpq_query_detail",
+                  "fields": [
+                    {
+                      "name": "start_time",
+                      "expression": "`start_time`"
+                    },
+                    {
+                      "name": "tenant_key",
+                      "expression": "`tenant_key`"
+                    },
+                    {
+                      "name": "executed_by",
+                      "expression": "`executed_by`"
+                    },
+                    {
+                      "name": "allocated_dollars_bar_html",
+                      "expression": "`allocated_dollars_bar_html`"
+                    },
+                    {
+                      "name": "allocated_dbus_bar_html",
+                      "expression": "`allocated_dbus_bar_html`"
+                    },
+                    {
+                      "name": "queue_ms",
+                      "expression": "`queue_ms`"
+                    },
+                    {
+                      "name": "query_source_type",
+                      "expression": "`query_source_type`"
+                    },
+                    {
+                      "name": "client_application",
+                      "expression": "`client_application`"
+                    },
+                    {
+                      "name": "execution_duration_ms",
+                      "expression": "`execution_duration_ms`"
+                    },
+                    {
+                      "name": "warehouse_name_display",
+                      "expression": "`warehouse_name_display`"
+                    },
+                    {
+                      "name": "statement_id",
+                      "expression": "`statement_id`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "title": "Query Cost Detail",
+                "showTitle": true
+              },
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "start_time",
+                    "displayName": "Time"
+                  },
+                  {
+                    "fieldName": "tenant_key",
+                    "displayName": "Tenant"
+                  },
+                  {
+                    "fieldName": "executed_by",
+                    "displayName": "Executed By"
+                  },
+                  {
+                    "fieldName": "allocated_dollars_bar_html",
+                    "displayName": "Allocated $",
+                    "style": {
+                      "type": "html"
+                    }
+                  },
+                  {
+                    "fieldName": "allocated_dbus_bar_html",
+                    "displayName": "Allocated DBUs",
+                    "style": {
+                      "type": "html"
+                    }
+                  },
+                  {
+                    "fieldName": "queue_ms",
+                    "displayName": "Queue ms"
+                  },
+                  {
+                    "fieldName": "query_source_type",
+                    "displayName": "Source Type"
+                  },
+                  {
+                    "fieldName": "client_application",
+                    "displayName": "Client"
+                  },
+                  {
+                    "fieldName": "execution_duration_ms",
+                    "displayName": "Exec ms"
+                  },
+                  {
+                    "fieldName": "warehouse_name_display",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "statement_id",
+                    "displayName": "Statement ID"
+                  }
+                ]
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 12,
+            "height": 9
+          }
+        },
+        {
+          "widget": {
+            "name": "wh_stats_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cpq_warehouse_stats",
+                  "fields": [
+                    {
+                      "name": "warehouse_name_display",
+                      "expression": "`warehouse_name_display`"
+                    },
+                    {
+                      "name": "query_count",
+                      "expression": "`query_count`"
+                    },
+                    {
+                      "name": "avg_cost_per_query",
+                      "expression": "`avg_cost_per_query`"
+                    },
+                    {
+                      "name": "median_cost_per_query",
+                      "expression": "`median_cost_per_query`"
+                    },
+                    {
+                      "name": "max_cost_per_query",
+                      "expression": "`max_cost_per_query`"
+                    },
+                    {
+                      "name": "min_cost_per_query",
+                      "expression": "`min_cost_per_query`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Cost per Query Statistics",
+                "showTitle": true
+              },
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "warehouse_name_display",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "query_count",
+                    "displayName": "Queries"
+                  },
+                  {
+                    "fieldName": "avg_cost_per_query",
+                    "displayName": "Avg $"
+                  },
+                  {
+                    "fieldName": "median_cost_per_query",
+                    "displayName": "Median $"
+                  },
+                  {
+                    "fieldName": "max_cost_per_query",
+                    "displayName": "Max $"
+                  },
+                  {
+                    "fieldName": "min_cost_per_query",
+                    "displayName": "Min $"
+                  }
+                ]
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 12,
+            "height": 4
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    },
+    {
       "name": "workspace_segmentation",
       "displayName": "Workspace Segmentation",
       "layout": [
@@ -1837,6 +2556,157 @@
         }
       ],
       "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    },
+    {
+      "name": "global_filters",
+      "displayName": "Global Filters",
+      "layout": [
+        {
+          "widget": {
+            "name": "dates_by",
+            "queries": [
+              {
+                "name": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae52af915b989fd2c2ba7b8b9d6_time_grain",
+                "query": {
+                  "datasetName": "dates_by_options",
+                  "fields": [
+                    {
+                      "name": "time_grain",
+                      "expression": "`time_grain`"
+                    },
+                    {
+                      "name": "time_grain_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_param_time_key",
+                "query": {
+                  "datasetName": "slim_cost_overview",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_param_time_key",
+                "query": {
+                  "datasetName": "slim_tenant_cost",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d58816eea7d5814cb9e33b99_param_time_key",
+                "query": {
+                  "datasetName": "slim_workspace_cost",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae693b81f62b2c0cdecacdfea7e_param_time_key",
+                "query": {
+                  "datasetName": "slim_identity_attribution",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae69dd61936b5f5f1cf8bd8958f_param_time_key",
+                "query": {
+                  "datasetName": "slim_ai_cost",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "selection": {
+                "defaultSelection": {
+                  "values": {
+                    "dataType": "STRING",
+                    "values": [
+                      {
+                        "value": "Day"
+                      }
+                    ]
+                  }
+                }
+              },
+              "frame": {
+                "title": "Dates by",
+                "showTitle": true
+              },
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "time_grain",
+                    "queryName": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae52af915b989fd2c2ba7b8b9d6_time_grain"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d58816eea7d5814cb9e33b99_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae693b81f62b2c0cdecacdfea7e_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae69dd61936b5f5f1cf8bd8958f_param_time_key"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 3,
+            "height": 2
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
       "layoutVersion": "GRID_V1"
     },
     {
@@ -2105,339 +2975,6 @@
         }
       ],
       "pageType": "PAGE_TYPE_CANVAS",
-      "layoutVersion": "GRID_V1"
-    },
-    {
-      "name": "global_filters",
-      "displayName": "Global Filters",
-      "layout": [
-        {
-          "widget": {
-            "name": "time_window",
-            "queries": [
-              {
-                "name": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_time_key",
-                "query": {
-                  "datasetName": "slim_cost_overview",
-                  "fields": [
-                    {
-                      "name": "time_key",
-                      "expression": "`time_key`"
-                    },
-                    {
-                      "name": "time_key_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_time_range",
-                "query": {
-                  "datasetName": "slim_cost_overview",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_time_range",
-                "query": {
-                  "datasetName": "slim_tenant_cost",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d58816eea7d5814cb9e33b99_time_range",
-                "query": {
-                  "datasetName": "slim_workspace_cost",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d18010e3bd392df974302fe6_time_range",
-                "query": {
-                  "datasetName": "slim_warehouse_monitor",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae61113127a8ac7ce1c7ad4f5f6_time_range",
-                "query": {
-                  "datasetName": "slim_tagging_pct",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae693b81f62b2c0cdecacdfea7e_time_range",
-                "query": {
-                  "datasetName": "slim_identity_attribution",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae6973d15a098614901dc982ac8_time_range",
-                "query": {
-                  "datasetName": "slim_tenant_economics",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae69dd61936b5f5f1cf8bd8958f_time_range",
-                "query": {
-                  "datasetName": "slim_ai_cost",
-                  "parameters": [
-                    {
-                      "name": "time_range",
-                      "keyword": "time_range"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "frame": {
-                "title": "Time Window",
-                "showTitle": true
-              },
-              "widgetType": "filter-date-range-picker",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "time_key",
-                    "queryName": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_time_key"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d58816eea7d5814cb9e33b99_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d18010e3bd392df974302fe6_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae61113127a8ac7ce1c7ad4f5f6_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae693b81f62b2c0cdecacdfea7e_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae6973d15a098614901dc982ac8_time_range"
-                  },
-                  {
-                    "parameterName": "time_range",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae69dd61936b5f5f1cf8bd8958f_time_range"
-                  }
-                ]
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 0,
-            "width": 3,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "dates_by",
-            "queries": [
-              {
-                "name": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae52af915b989fd2c2ba7b8b9d6_time_grain",
-                "query": {
-                  "datasetName": "dates_by_options",
-                  "fields": [
-                    {
-                      "name": "time_grain",
-                      "expression": "`time_grain`"
-                    },
-                    {
-                      "name": "time_grain_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_param_time_key",
-                "query": {
-                  "datasetName": "slim_cost_overview",
-                  "parameters": [
-                    {
-                      "name": "param_time_key",
-                      "keyword": "param_time_key"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_param_time_key",
-                "query": {
-                  "datasetName": "slim_tenant_cost",
-                  "parameters": [
-                    {
-                      "name": "param_time_key",
-                      "keyword": "param_time_key"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d58816eea7d5814cb9e33b99_param_time_key",
-                "query": {
-                  "datasetName": "slim_workspace_cost",
-                  "parameters": [
-                    {
-                      "name": "param_time_key",
-                      "keyword": "param_time_key"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae693b81f62b2c0cdecacdfea7e_param_time_key",
-                "query": {
-                  "datasetName": "slim_identity_attribution",
-                  "parameters": [
-                    {
-                      "name": "param_time_key",
-                      "keyword": "param_time_key"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae69dd61936b5f5f1cf8bd8958f_param_time_key",
-                "query": {
-                  "datasetName": "slim_ai_cost",
-                  "parameters": [
-                    {
-                      "name": "param_time_key",
-                      "keyword": "param_time_key"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "selection": {
-                "defaultSelection": {
-                  "values": {
-                    "dataType": "STRING",
-                    "values": [
-                      {
-                        "value": "Day"
-                      }
-                    ]
-                  }
-                }
-              },
-              "frame": {
-                "title": "Dates by",
-                "showTitle": true
-              },
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "time_grain",
-                    "queryName": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae52af915b989fd2c2ba7b8b9d6_time_grain"
-                  },
-                  {
-                    "parameterName": "param_time_key",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4b68f19c1988b8e1883a4befc_param_time_key"
-                  },
-                  {
-                    "parameterName": "param_time_key",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_param_time_key"
-                  },
-                  {
-                    "parameterName": "param_time_key",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4d58816eea7d5814cb9e33b99_param_time_key"
-                  },
-                  {
-                    "parameterName": "param_time_key",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae693b81f62b2c0cdecacdfea7e_param_time_key"
-                  },
-                  {
-                    "parameterName": "param_time_key",
-                    "queryName": "parameter_dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae69dd61936b5f5f1cf8bd8958f_param_time_key"
-                  }
-                ]
-              }
-            }
-          },
-          "position": {
-            "x": 3,
-            "y": 0,
-            "width": 3,
-            "height": 2
-          }
-        }
-      ],
-      "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
       "layoutVersion": "GRID_V1"
     },
     {
