@@ -2130,16 +2130,12 @@
                   "datasetName": "cpq_query_detail",
                   "fields": [
                     {
+                      "name": "statement_id",
+                      "expression": "`statement_id`"
+                    },
+                    {
                       "name": "start_time",
                       "expression": "`start_time`"
-                    },
-                    {
-                      "name": "tenant_key",
-                      "expression": "`tenant_key`"
-                    },
-                    {
-                      "name": "executed_by",
-                      "expression": "`executed_by`"
                     },
                     {
                       "name": "allocated_dollars_bar_html",
@@ -2150,8 +2146,12 @@
                       "expression": "`allocated_dbus_bar_html`"
                     },
                     {
-                      "name": "queue_ms",
-                      "expression": "`queue_ms`"
+                      "name": "tenant_key",
+                      "expression": "`tenant_key`"
+                    },
+                    {
+                      "name": "executed_by",
+                      "expression": "`executed_by`"
                     },
                     {
                       "name": "query_source_type",
@@ -2166,12 +2166,12 @@
                       "expression": "`execution_duration_ms`"
                     },
                     {
-                      "name": "warehouse_name_display",
-                      "expression": "`warehouse_name_display`"
+                      "name": "queue_ms",
+                      "expression": "`queue_ms`"
                     },
                     {
-                      "name": "statement_id",
-                      "expression": "`statement_id`"
+                      "name": "warehouse_name_display",
+                      "expression": "`warehouse_name_display`"
                     }
                   ],
                   "disaggregated": true
@@ -2188,16 +2188,19 @@
               "encodings": {
                 "columns": [
                   {
+                    "fieldName": "statement_id",
+                    "displayName": "Statement ID",
+                    "actions": {
+                      "click": {
+                        "type": "link",
+                        "urlTemplate": "https://dbc-eca83c32-b44b.cloud.databricks.com/sql/history?o=3590757798436003&queryId={{ @ }}",
+                        "openInNewTab": true
+                      }
+                    }
+                  },
+                  {
                     "fieldName": "start_time",
                     "displayName": "Time"
-                  },
-                  {
-                    "fieldName": "tenant_key",
-                    "displayName": "Tenant"
-                  },
-                  {
-                    "fieldName": "executed_by",
-                    "displayName": "Executed By"
                   },
                   {
                     "fieldName": "allocated_dollars_bar_html",
@@ -2214,8 +2217,12 @@
                     }
                   },
                   {
-                    "fieldName": "queue_ms",
-                    "displayName": "Queue ms"
+                    "fieldName": "tenant_key",
+                    "displayName": "Tenant"
+                  },
+                  {
+                    "fieldName": "executed_by",
+                    "displayName": "Executed By"
                   },
                   {
                     "fieldName": "query_source_type",
@@ -2230,12 +2237,12 @@
                     "displayName": "Exec ms"
                   },
                   {
-                    "fieldName": "warehouse_name_display",
-                    "displayName": "Warehouse"
+                    "fieldName": "queue_ms",
+                    "displayName": "Queue ms"
                   },
                   {
-                    "fieldName": "statement_id",
-                    "displayName": "Statement ID"
+                    "fieldName": "warehouse_name_display",
+                    "displayName": "Warehouse"
                   }
                 ]
               },
