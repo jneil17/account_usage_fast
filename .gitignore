@@ -13,3 +13,6 @@ __pycache__/
 .env
 .venv/
 venv/
+
+# Data-generation harness: generated warehouse-id file
+data_generation/warehouses.env

@@ -25,7 +25,7 @@ WITH mapping AS (
   WHERE effective_to IS NULL OR effective_to > CURRENT_DATE
 )
 SELECT
-  u.usage_record_id,
+  u.record_id AS usage_record_id,
   u.workspace_id,
   u.usage_date,
   u.billing_origin_product,
