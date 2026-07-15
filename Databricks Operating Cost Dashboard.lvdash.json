@@ -798,6 +798,7 @@
         ")\n",
         "SELECT\n",
         "  c.*,\n",
+        "  from_utc_timestamp(start_time, 'America/New_York') AS start_time_est,\n",
         "  c.query_attributed_dollars_estimation * (1 - CAST(:dbsql_discount AS FLOAT))\n",
         "    AS query_attributed_dollars_with_discount,\n",
         "  -- HTML data-bar: attributed $ (brand red-orange #FF3621)\n",
@@ -1420,7 +1421,7 @@
               "lines": [
                 "# Cost by Tenant\n",
                 "---\n",
-                "Tenant attribution uses `custom_tags['tenant']`. [How to tag compute resources →](https://docs.databricks.com/en/administration-guide/account-settings/usage-detail-tags.html)"
+                "Tenant attribution uses `custom_tags['tenant']`. [How to tag compute resources →](https://docs.databricks.com/en/administration-guide/account-settings/usage-detail-tags.html) | [Data generation harness & tagging guide →](https://github.com/jneil17/account_usage_fast/blob/data-generation-harness/data_generation/README.md)"
               ]
             }
           },
@@ -1488,12 +1489,12 @@
                   "datasetName": "slim_tenant_cost",
                   "fields": [
                     {
-                      "name": "sum(cost_usd)",
-                      "expression": "SUM(`cost_usd`)"
-                    },
-                    {
                       "name": "tenant",
                       "expression": "`tenant`"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
                     }
                   ],
                   "filters": [
@@ -1527,6 +1528,12 @@
                       "by": "x-reversed"
                     }
                   }
+                },
+                "color": {
+                  "fieldName": "tenant",
+                  "scale": {
+                    "type": "categorical"
+                  }
                 }
               },
               "data": {
@@ -1536,7 +1543,7 @@
           },
           "position": {
             "x": 0,
-            "y": 4,
+            "y": 5,
             "width": 5,
             "height": 8
           }
@@ -1604,7 +1611,7 @@
           },
           "position": {
             "x": 5,
-            "y": 4,
+            "y": 5,
             "width": 7,
             "height": 8
           }
@@ -1651,7 +1658,8 @@
                     "fieldName": "time_key"
                   },
                   {
-                    "fieldName": "sum(cost_usd)"
+                    "fieldName": "sum(cost_usd)",
+                    "displayName": "Cost ($DBU)"
                   }
                 ]
               },
@@ -1662,9 +1670,9 @@
           },
           "position": {
             "x": 0,
-            "y": 12,
+            "y": 13,
             "width": 12,
-            "height": 8
+            "height": 5
           }
         },
         {
@@ -1816,7 +1824,7 @@
           },
           "position": {
             "x": 0,
-            "y": 20,
+            "y": 18,
             "width": 12,
             "height": 2
           }
@@ -1874,7 +1882,7 @@
           },
           "position": {
             "x": 0,
-            "y": 22,
+            "y": 20,
             "width": 6,
             "height": 8
           }
@@ -1942,9 +1950,55 @@
           },
           "position": {
             "x": 6,
-            "y": 22,
+            "y": 20,
             "width": 6,
             "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "tenant1",
+            "queries": [
+              {
+                "name": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_tenant",
+                "query": {
+                  "datasetName": "slim_tenant_cost",
+                  "fields": [
+                    {
+                      "name": "tenant",
+                      "expression": "`tenant`"
+                    },
+                    {
+                      "name": "tenant_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "showTitle": true,
+                "title": "Tenant"
+              },
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "tenant",
+                    "queryName": "dashboards/01f17ae488aa1c79b56a0e5f3748fa8f/datasets/01f17ae4affe160d8e68f7f40fa48317_tenant"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 12,
+            "height": 1
           }
         }
       ],
@@ -1969,7 +2023,7 @@
           "position": {
             "x": 0,
             "y": 0,
-            "width": 12,
+            "width": 9,
             "height": 2
           }
         },
@@ -2134,8 +2188,8 @@
                       "expression": "`statement_id`"
                     },
                     {
-                      "name": "start_time",
-                      "expression": "`start_time`"
+                      "name": "start_time_est",
+                      "expression": "`start_time_est`"
                     },
                     {
                       "name": "allocated_dollars_bar_html",
@@ -2184,6 +2238,7 @@
                 "showTitle": true
               },
               "version": 2,
+              "rowsPerPage": 500,
               "widgetType": "table",
               "encodings": {
                 "columns": [
@@ -2199,8 +2254,8 @@
                     }
                   },
                   {
-                    "fieldName": "start_time",
-                    "displayName": "Time"
+                    "fieldName": "start_time_est",
+                    "displayName": "Time (EST)"
                   },
                   {
                     "fieldName": "allocated_dollars_bar_html",
@@ -2253,7 +2308,7 @@
           },
           "position": {
             "x": 0,
-            "y": 8,
+            "y": 9,
             "width": 12,
             "height": 9
           }
@@ -2340,7 +2395,58 @@
             "x": 0,
             "y": 4,
             "width": 12,
-            "height": 4
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "most-recent",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cpq_query_detail",
+                  "fields": [
+                    {
+                      "name": "max(start_time_est)",
+                      "expression": "MAX(`start_time_est`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "showTitle": true,
+                "title": "Most Recent Query:"
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "max(start_time_est)",
+                  "format": {
+                    "type": "date-time",
+                    "date": "locale-number-month",
+                    "time": "locale-hour-minute",
+                    "leadingZeros": true
+                  },
+                  "style": {
+                    "fontSize": 20
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 0,
+            "width": 3,
+            "height": 2
           }
         }
       ],
